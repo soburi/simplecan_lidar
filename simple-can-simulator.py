@@ -35,6 +35,7 @@ import errno
 import threading
 import time
 import math
+import serial
 
 class CANSocket(object):
     FORMAT = "<IB3x8s"
@@ -170,36 +171,39 @@ class DiagnosticMessageHandler(object):
 
     def run(self):
         while True:
-            can_id, data = self.can_sock.recv()
-            #print('%03X#%s' % (can_id, ''.join(format(x, '02X') for x in data)))
-            if can_id == 0x7df:
-                # OBD-II request
-                if data[1] == 0x01 and data[2] == 0x0C:
-                    # Engine speed
-                    speed = self.simulator.get_engine_speed()
-                    #print('engine speed = %d' % speed)
-                    if speed > 16383.75:
-                        speed = 16383.75
-                    reply = [ 0x04, 0x41, 0x0C ]
-                    reply.append(4 * speed // 256)
-                    reply.append(4 * speed % 256)
-                    # pad remaining bytes to make 8
-                    reply.append(0)
-                    reply.append(0)
-                    reply.append(0)
-                    self.can_sock.send(0x7e8, bytes(reply), 0)
-                elif data[1] == 0x01 and data[2] == 0x0D:
-                    # Vehicle speed
-                    speed = int(self.simulator.get_vehicle_speed()) % 256
-                    #print('vehicle speed = %d' % speed)
-                    reply = [ 0x03, 0x41, 0x0D ]
-                    reply.append(speed)
-                    # pad remaining bytes to make 8
-                    reply.append(0)
-                    reply.append(0)
-                    reply.append(0)
-                    reply.append(0)
-                    self.can_sock.send(0x7e8, bytes(reply), 0)
+            try:
+                can_id, data = self.can_sock.recv()
+                #print('%03X#%s' % (can_id, ''.join(format(x, '02X') for x in data)))
+                if can_id == 0x7df:
+                    # OBD-II request
+                    if data[1] == 0x01 and data[2] == 0x0C:
+                        # Engine speed
+                        speed = self.simulator.get_engine_speed()
+                        #print('engine speed = %d' % speed)
+                        if speed > 16383.75:
+                            speed = 16383.75
+                        reply = [ 0x04, 0x41, 0x0C ]
+                        reply.append(4 * speed // 256)
+                        reply.append(4 * speed % 256)
+                        # pad remaining bytes to make 8
+                        reply.append(0)
+                        reply.append(0)
+                        reply.append(0)
+                        self.can_sock.send(0x7e8, bytes(reply), 0)
+                    elif data[1] == 0x01 and data[2] == 0x0D:
+                        # Vehicle speed
+                        speed = int(self.simulator.get_vehicle_speed()) % 256
+                        #print('vehicle speed = %d' % speed)
+                        reply = [ 0x03, 0x41, 0x0D ]
+                        reply.append(speed)
+                        # pad remaining bytes to make 8
+                        reply.append(0)
+                        reply.append(0)
+                        reply.append(0)
+                        reply.append(0)
+                        self.can_sock.send(0x7e8, bytes(reply), 0)
+            except e:
+                print(e)
 
 class SteeringWheelMessageHandler(object):
     def __init__(self, can_sock, simulator, verbose=False):
@@ -324,7 +328,7 @@ class StatusMessageSender(object):
             msg.append(0)
             msg.append(0)
             msg.append(0)
-            print("can_sock send 0x3d9", file=sys.stderr)
+            #print("can_sock send 0x3d9", file=sys.stderr)
             self.can_sock.send(0x3d9, bytes(msg), 0)
 
             # Vehicle speed
@@ -350,56 +354,117 @@ class StatusMessageSender(object):
             time.sleep(0.1)
 
 class LidarMessageSender(object):
-    """Periodically send batches of Lidar angle/distance pairs."""
+    """Send LIDAR angle/distance pairs either from a COIN-D4 device or a synthetic generator."""
 
-    def __init__(self, can_sock, verbose=False):
+    START_CMD = bytes([0xAA, 0x55, 0xF0, 0x0F])
+    END_CMD = bytes([0xAA, 0x55, 0xF5, 0x0A])
+    HIGH_SPEED_CMD = bytes([0xAA, 0x55, 0xF2, 0x0D])
+    LOW_SPEED_CMD = bytes([0xAA, 0x55, 0xF1, 0x0E])
+
+    HEADER = b"\xAA\x55"
+    TYPE_MASK = 0x01
+    FREQ_MASK = 0xFE
+
+    def __init__(self, can_sock, verbose=False, port='/dev/ttyACM0', baudrate=230400, speed='high'):
         self.can_sock = can_sock
         self.verbose = verbose
         self.thread = threading.Thread(target=self.run, daemon=True)
 
-        # Number of angle/distance pairs to send in each batch
-        # Matches the LIDAR display update rate used in the Flutter app.
-        self.batch_size = 45
+        # Serial configuration (None -> use synthetic data)
+        print(port)
+        self.port = port
+        self.baudrate = baudrate
+        self.speed = speed
 
-        # Keep track of the current angle index and phase shift
+        # Synthetic generation parameters
+        self.batch_size = 45
         self._idx = 0
         self._tick = 0
 
     def start(self):
         self.thread.start()
 
+    def _parse_packet(self, packet):
+        """Parse a COIN-D4 packet and return a list of (distance[m], angle[deg])"""
+        m_t = packet[2]
+        lsn = packet[3]
+        fsa_raw = packet[4] | (packet[5] << 8)
+        lsa_raw = packet[6] | (packet[7] << 8)
+        samples = packet[10:]
+        start_angle = fsa_raw / 100.0
+        end_angle = lsa_raw / 100.0
+        points = []
+        for i in range(lsn):
+            idx = i * 3
+            if idx + 3 > len(samples):
+                break
+            dist = (samples[idx+1] >> 2) | (samples[idx+2] << 8)  # mm
+            if lsn > 1:
+                angle = start_angle + (end_angle - start_angle) * i / (lsn - 1)
+            else:
+                angle = start_angle
+            points.append((dist / 1000.0, angle))
+        return points
+
     def run(self):
-        while True:
-            # Send a batch of points using the same pattern as the Flutter
-            # getCanPointStream() implementation.  The distance is a sine wave
-            # with amplitude 5 m, offset by 5 m.  The phase (tick) is advanced
-            # each time a batch is sent so that the pattern appears to rotate
-            # over time.
-            for _ in range(self.batch_size):
-                angle = self._idx % 360
-                distance = 5 + 5 * math.sin(math.radians(angle + self._tick))
-                if self.verbose:
-                    print(f'lidar angle = {angle} distance = {distance}')
+        if self.port:
+            ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
 
-                # Convert to raw 16-bit values according to the DBC:
-                #   LIDAR_Angle    : 0.01 deg/bit
-                #   LIDAR_Distance : 0.001 m/bit
-                angle_raw = int(angle / 0.01)
-                distance_raw = int(distance / 0.001)
-                data = struct.pack('<H', distance_raw)
-                self.can_sock.send(0x680 + angle, data, 0)
-                self._idx += 1
-
-            # Advance the phase for the next batch
-            self._tick = (self._tick + 1) % 360
-
-            # Wait before sending the next set of points
+            ser.write(self.START_CMD)
+            ser.flush()
             time.sleep(0.2)
+
+            speed_cmd = self.HIGH_SPEED_CMD if self.speed == 'high' else self.LOW_SPEED_CMD
+            ser.write(speed_cmd)
+            ser.flush()
+
+            buf = bytearray()
+            while True:
+                byte = ser.read(1)
+                if not byte:
+                    continue
+                buf += byte
+                while len(buf) >= 8:
+                    idx = buf.find(self.HEADER)
+                    if idx < 0:
+                        buf.clear()
+                        break
+                    if len(buf) < idx + 10:
+                        break
+                    lsn = buf[idx+3]
+                    packet_length = 10 + lsn * 3
+                    if len(buf) < idx + packet_length:
+                        break
+                    packet = bytes(buf[idx:idx+packet_length])
+                    del buf[:idx+packet_length]
+                    for dist, angle in self._parse_packet(packet):
+                        angle_id = int(angle) % 360
+                        distance_raw = int(dist / 0.001)
+                        data = struct.pack('<H', distance_raw)
+                        if self.verbose:
+                            print(f'lidar angle = {angle:.2f} distance = {dist:.3f}')
+                        self.can_sock.send(0x680 + angle_id, data, 0)
+        else:
+            while True:
+                for _ in range(self.batch_size):
+                    angle = self._idx % 360
+                    distance = 5 + 5 * math.sin(math.radians(angle + self._tick))
+                    if self.verbose:
+                        print(f'lidar angle = {angle} distance = {distance}')
+                    distance_raw = int(distance / 0.001)
+                    data = struct.pack('<H', distance_raw)
+                    self.can_sock.send(0x680 + angle, data, 0)
+                    self._idx += 1
+                self._tick = (self._tick + 1) % 360
+                time.sleep(0.2)
 
 def main():
     parser = argparse.ArgumentParser(description='Simple CAN vehicle simulator.')
     parser.add_argument('interface', type=str, help='interface name (e.g. vcan0)')
     parser.add_argument('--lin-interface', help='Separate LIN interface name (e.g. sllin0)')
+    parser.add_argument('--lidar-port', type=str, default='/dev/ttyUSB0', help='Serial port for COIN-D4 LIDAR')
+    parser.add_argument('--lidar-baudrate', type=int, default=230400, help='LIDAR serial baudrate')
+    parser.add_argument('--lidar-speed', choices=['high', 'low'], default='low', help='LIDAR scan speed')
     parser.add_argument('-v', '--verbose', help='increase output verbosity', action='store_true')
     args = parser.parse_args()
 
@@ -418,7 +483,13 @@ def main():
     print('Using {0}'.format(args.interface))
     sim = VehicleSimulator()
     status_sender = StatusMessageSender(can_sock, sim, args.verbose)
-    lidar_sender = LidarMessageSender(can_sock, args.verbose)
+    lidar_sender = LidarMessageSender(
+        can_sock,
+        args.verbose,
+        port=args.lidar_port,
+        baudrate=args.lidar_baudrate,
+        speed=args.lidar_speed,
+    )
     diag_handler = DiagnosticMessageHandler(diag_can_sock, sim, args.verbose)
     steeringwheel_handler = SteeringWheelMessageHandler(steeringwheel_can_sock, sim, args.verbose)
     sim.start()
