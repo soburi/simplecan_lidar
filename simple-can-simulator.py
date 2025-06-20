@@ -36,6 +36,7 @@ import threading
 import time
 import math
 import serial
+import collections
 
 class CANSocket(object):
     FORMAT = "<IB3x8s"
@@ -381,6 +382,12 @@ class LidarMessageSender(object):
         self._idx = 0
         self._tick = 0
 
+        # Moving average buffers for each degree
+        self.angle_buffers = [collections.deque(maxlen=4) for _ in range(360)]
+        self.segment_size = 90
+        self.send_interval = 0.25
+        self._current_segment = 0
+
     def start(self):
         self.thread.start()
 
@@ -407,6 +414,7 @@ class LidarMessageSender(object):
         return points
 
     def run(self):
+        next_send = time.time() + self.send_interval
         if self.port:
             ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
 
@@ -421,9 +429,8 @@ class LidarMessageSender(object):
             buf = bytearray()
             while True:
                 byte = ser.read(1)
-                if not byte:
-                    continue
-                buf += byte
+                if byte:
+                    buf += byte
                 while len(buf) >= 8:
                     idx = buf.find(self.HEADER)
                     if idx < 0:
@@ -439,24 +446,38 @@ class LidarMessageSender(object):
                     del buf[:idx+packet_length]
                     for dist, angle in self._parse_packet(packet):
                         angle_id = int(angle) % 360
-                        distance_raw = int(dist / 0.001)
-                        data = struct.pack('<H', distance_raw)
-                        if self.verbose:
-                            print(f'lidar angle = {angle:.2f} distance = {dist:.3f}')
-                        self.can_sock.send(0x680 + angle_id, data, 0)
+                        self.angle_buffers[angle_id].append(dist)
+                if time.time() >= next_send:
+                    self._send_segment()
+                    next_send += self.send_interval
         else:
             while True:
-                for _ in range(self.batch_size):
-                    angle = self._idx % 360
-                    distance = 5 + 5 * math.sin(math.radians(angle + self._tick))
-                    if self.verbose:
-                        print(f'lidar angle = {angle} distance = {distance}')
-                    distance_raw = int(distance / 0.001)
-                    data = struct.pack('<H', distance_raw)
-                    self.can_sock.send(0x680 + angle, data, 0)
-                    self._idx += 1
-                self._tick = (self._tick + 1) % 360
-                time.sleep(0.2)
+                angle = self._idx % 360
+                distance = 5 + 5 * math.sin(math.radians(angle + self._tick))
+                self.angle_buffers[angle].append(distance)
+                self._idx += 1
+                if self._idx % self.batch_size == 0:
+                    self._tick = (self._tick + 1) % 360
+                if time.time() >= next_send:
+                    self._send_segment()
+                    next_send += self.send_interval
+                time.sleep(0.005)
+
+    def _send_segment(self):
+        start = self._current_segment
+        for i in range(self.segment_size):
+            angle = (start + i) % 360
+            buf = self.angle_buffers[angle]
+            if buf:
+                avg = sum(buf) / len(buf)
+            else:
+                avg = 0.0
+            distance_raw = int(avg / 0.001)
+            data = struct.pack('<H', distance_raw)
+            if self.verbose:
+                print(f'lidar angle = {angle} avg distance = {avg:.3f}')
+            self.can_sock.send(0x680 + angle, data, 0)
+        self._current_segment = (self._current_segment + self.segment_size) % 360
 
 def main():
     parser = argparse.ArgumentParser(description='Simple CAN vehicle simulator.')
