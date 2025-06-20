@@ -171,36 +171,39 @@ class DiagnosticMessageHandler(object):
 
     def run(self):
         while True:
-            can_id, data = self.can_sock.recv()
-            #print('%03X#%s' % (can_id, ''.join(format(x, '02X') for x in data)))
-            if can_id == 0x7df:
-                # OBD-II request
-                if data[1] == 0x01 and data[2] == 0x0C:
-                    # Engine speed
-                    speed = self.simulator.get_engine_speed()
-                    #print('engine speed = %d' % speed)
-                    if speed > 16383.75:
-                        speed = 16383.75
-                    reply = [ 0x04, 0x41, 0x0C ]
-                    reply.append(4 * speed // 256)
-                    reply.append(4 * speed % 256)
-                    # pad remaining bytes to make 8
-                    reply.append(0)
-                    reply.append(0)
-                    reply.append(0)
-                    self.can_sock.send(0x7e8, bytes(reply), 0)
-                elif data[1] == 0x01 and data[2] == 0x0D:
-                    # Vehicle speed
-                    speed = int(self.simulator.get_vehicle_speed()) % 256
-                    #print('vehicle speed = %d' % speed)
-                    reply = [ 0x03, 0x41, 0x0D ]
-                    reply.append(speed)
-                    # pad remaining bytes to make 8
-                    reply.append(0)
-                    reply.append(0)
-                    reply.append(0)
-                    reply.append(0)
-                    self.can_sock.send(0x7e8, bytes(reply), 0)
+            try:
+                can_id, data = self.can_sock.recv()
+                #print('%03X#%s' % (can_id, ''.join(format(x, '02X') for x in data)))
+                if can_id == 0x7df:
+                    # OBD-II request
+                    if data[1] == 0x01 and data[2] == 0x0C:
+                        # Engine speed
+                        speed = self.simulator.get_engine_speed()
+                        #print('engine speed = %d' % speed)
+                        if speed > 16383.75:
+                            speed = 16383.75
+                        reply = [ 0x04, 0x41, 0x0C ]
+                        reply.append(4 * speed // 256)
+                        reply.append(4 * speed % 256)
+                        # pad remaining bytes to make 8
+                        reply.append(0)
+                        reply.append(0)
+                        reply.append(0)
+                        self.can_sock.send(0x7e8, bytes(reply), 0)
+                    elif data[1] == 0x01 and data[2] == 0x0D:
+                        # Vehicle speed
+                        speed = int(self.simulator.get_vehicle_speed()) % 256
+                        #print('vehicle speed = %d' % speed)
+                        reply = [ 0x03, 0x41, 0x0D ]
+                        reply.append(speed)
+                        # pad remaining bytes to make 8
+                        reply.append(0)
+                        reply.append(0)
+                        reply.append(0)
+                        reply.append(0)
+                        self.can_sock.send(0x7e8, bytes(reply), 0)
+            except e:
+                print(e)
 
 class SteeringWheelMessageHandler(object):
     def __init__(self, can_sock, simulator, verbose=False):
@@ -325,7 +328,7 @@ class StatusMessageSender(object):
             msg.append(0)
             msg.append(0)
             msg.append(0)
-            print("can_sock send 0x3d9", file=sys.stderr)
+            #print("can_sock send 0x3d9", file=sys.stderr)
             self.can_sock.send(0x3d9, bytes(msg), 0)
 
             # Vehicle speed
@@ -362,12 +365,13 @@ class LidarMessageSender(object):
     TYPE_MASK = 0x01
     FREQ_MASK = 0xFE
 
-    def __init__(self, can_sock, verbose=False, port=None, baudrate=230400, speed='high'):
+    def __init__(self, can_sock, verbose=False, port='/dev/ttyACM0', baudrate=230400, speed='high'):
         self.can_sock = can_sock
         self.verbose = verbose
         self.thread = threading.Thread(target=self.run, daemon=True)
 
         # Serial configuration (None -> use synthetic data)
+        print(port)
         self.port = port
         self.baudrate = baudrate
         self.speed = speed
@@ -458,9 +462,9 @@ def main():
     parser = argparse.ArgumentParser(description='Simple CAN vehicle simulator.')
     parser.add_argument('interface', type=str, help='interface name (e.g. vcan0)')
     parser.add_argument('--lin-interface', help='Separate LIN interface name (e.g. sllin0)')
-    parser.add_argument('--lidar-port', help='Serial port for COIN-D4 LIDAR')
+    parser.add_argument('--lidar-port', type=str, default='/dev/ttyUSB0', help='Serial port for COIN-D4 LIDAR')
     parser.add_argument('--lidar-baudrate', type=int, default=230400, help='LIDAR serial baudrate')
-    parser.add_argument('--lidar-speed', choices=['high', 'low'], default='high', help='LIDAR scan speed')
+    parser.add_argument('--lidar-speed', choices=['high', 'low'], default='low', help='LIDAR scan speed')
     parser.add_argument('-v', '--verbose', help='increase output verbosity', action='store_true')
     args = parser.parse_args()
 
